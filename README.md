@@ -1,44 +1,13 @@
 # leafrun-storage
 
-Planned S3 artifact and snapshot service: uploads, downloads, retention, pins and garbage collection.
+## Keep outputs for a limited time
 
-**Status: planned component.** This repository currently contains its scope and roadmap links. It does not yet provide a runnable service or package. The existing local rendering prototype lives in [leafrun-generation](https://github.com/leafrun/leafrun-generation).
+The planned Storage service will put PDF results and immutable project snapshots in S3-compatible storage. It will issue artifact IDs, serve authorized downloads, and delete expired objects. The default PDF lifetime is 24 hours.
 
-## Responsibility
+Generation writes finished outputs here. Collaboration and Projects can pin snapshots that are still in use. Storage owns bytes and retention, not render jobs.
 
-Blob inventory, snapshot manifests, artifacts, uploads, pins, expiry, GC.
+**Status:** this repository is a planned component. It has no runnable implementation yet. The working local renderer is in [leafrun-generation](https://github.com/leafrun/leafrun-generation).
 
-Owns the logical PostgreSQL database `storage_db`, its credentials and migrations. Other domains access this data through contracts, never cross-domain SQL.
+**First roadmap step:** [LEA-18 — Store and expire PDFs](https://linear.app/bulnik/issue/LEA-18/e03-s3-rezultaty-i-ochistka). Linear may require workspace access; the public [roadmap](https://github.com/leafrun/leafrun/blob/main/docs/roadmap.md) explains the build order. See the [repository map](https://github.com/leafrun/leafrun/blob/main/docs/repositories.md) and [contribution guide](https://github.com/leafrun/leafrun/blob/main/CONTRIBUTING.md).
 
-Planned process roles:
-
-- `api-download-gateway`
-- `gc-workflow-workers`
-- `gc-activity-workers`
-- `reconciler`
-
-## Dependencies
-
-- [leafrun-contracts](https://github.com/leafrun/leafrun-contracts)
-- [leafrun-platform](https://github.com/leafrun/leafrun-platform)
-- `s3`
-- `access-api`
-
-## Boundaries
-
-No unique durable local state; activity scratch and workflow replay cache disposable. API and worker processes scale and release independently. S3 holds bytes; domain databases hold durable metadata. Redis is a disposable cache; NATS JetStream carries domain events; Temporal owns workflow task queues.
-
-## Roadmap
-
-- [LEA-18 — S3 artifacts and garbage collection](https://linear.app/bulnik/issue/LEA-18/e03-s3-rezultaty-i-ochistka)
-- [LEA-114 — Caching, operations and scaling](https://linear.app/bulnik/issue/LEA-114/e15-keshirovanie-ekspluataciya-i-masshtabirovanie)
-
-See the [development roadmap](https://github.com/leafrun/leafrun/blob/main/docs/roadmap.md) for dependencies and acceptance milestones. Creating this repository does not complete its implementation issues.
-
-## Contributing
-
-Use English for code comments, documentation, examples, commit messages and pull requests. See the [contribution guide](https://github.com/leafrun/leafrun/blob/main/CONTRIBUTING.md) and [current architecture](https://github.com/leafrun/leafrun/blob/main/docs/architecture.md).
-
-## License status
-
-A project license has not been selected. No license is assigned by this repository scaffold.
+No project license has been selected yet.
