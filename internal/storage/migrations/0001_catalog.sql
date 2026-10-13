@@ -1,0 +1,15 @@
+CREATE TABLE IF NOT EXISTS storage_objects(id text PRIMARY KEY,workspace text NOT NULL,project text NOT NULL,class text NOT NULL,state text NOT NULL DEFAULT 'ready',hash text NOT NULL DEFAULT '',size bigint NOT NULL DEFAULT 0,physical_key text NOT NULL DEFAULT '',version text NOT NULL DEFAULT '',created_at timestamptz NOT NULL,expires_at timestamptz);
+CREATE TABLE IF NOT EXISTS storage_uploads(id text PRIMARY KEY,object_id text NOT NULL REFERENCES storage_objects(id),writer text NOT NULL,lease_until timestamptz NOT NULL,state text NOT NULL,creator text NOT NULL,resource_id text,artifact_id text,receipt_fingerprint text);
+CREATE TABLE IF NOT EXISTS storage_resources(id text PRIMARY KEY REFERENCES storage_objects(id),UNIQUE(id));
+CREATE UNIQUE INDEX IF NOT EXISTS storage_resource_dedup ON storage_objects(workspace,project,class,hash,size) WHERE class IN ('resource','recovery') AND state='ready' AND physical_key<>'';
+CREATE TABLE IF NOT EXISTS storage_snapshots(id text PRIMARY KEY REFERENCES storage_objects(id),manifest jsonb NOT NULL,bindings jsonb NOT NULL);
+CREATE TABLE IF NOT EXISTS storage_snapshot_refs(snapshot_id text NOT NULL REFERENCES storage_snapshots(id),resource_id text NOT NULL REFERENCES storage_resources(id),binding text NOT NULL,PRIMARY KEY(snapshot_id,binding));
+CREATE TABLE IF NOT EXISTS storage_artifacts(id text PRIMARY KEY REFERENCES storage_objects(id),snapshot_id text NOT NULL REFERENCES storage_snapshots(id),origin_job text NOT NULL,metadata jsonb NOT NULL);
+CREATE TABLE IF NOT EXISTS storage_pins(id text PRIMARY KEY,object_id text NOT NULL REFERENCES storage_objects(id),holder_domain text NOT NULL,holder_id text NOT NULL,policy text NOT NULL,state text NOT NULL,created_at timestamptz NOT NULL,expires_at timestamptz NOT NULL,activated_at timestamptz);
+CREATE TABLE IF NOT EXISTS storage_read_leases(id text PRIMARY KEY,object_id text NOT NULL REFERENCES storage_objects(id),expires_at timestamptz NOT NULL);
+CREATE TABLE IF NOT EXISTS storage_idempotency(principal text NOT NULL,operation text NOT NULL,key text NOT NULL,fingerprint text NOT NULL,object_id text NOT NULL,created_at timestamptz NOT NULL,PRIMARY KEY(principal,operation,key));
+CREATE TABLE IF NOT EXISTS storage_physical_versions(physical_key text NOT NULL,version text NOT NULL,object_id text,created_at timestamptz NOT NULL,state text NOT NULL DEFAULT 'ready',PRIMARY KEY(physical_key,version));
+CREATE TABLE IF NOT EXISTS storage_deletion_history(id text PRIMARY KEY,deleted_at timestamptz NOT NULL,class text NOT NULL,bytes bigint NOT NULL);
+CREATE TABLE IF NOT EXISTS storage_gc_cursor(id integer PRIMARY KEY,physical_key text NOT NULL DEFAULT '',version text NOT NULL DEFAULT '');
+INSERT INTO storage_gc_cursor(id) VALUES(1) ON CONFLICT DO NOTHING;
+CREATE TABLE IF NOT EXISTS storage_scratch(path text PRIMARY KEY,upload_id text NOT NULL,state text NOT NULL,created_at timestamptz NOT NULL,stopped_at timestamptz);
