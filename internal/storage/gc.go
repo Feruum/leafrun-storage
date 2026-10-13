@@ -46,7 +46,7 @@ func (s *Service) GC(ctx context.Context) error {
 		if e != nil {
 			return e
 		}
-		rows, e := t.Query(ctx, `SELECT o.id FROM storage_objects o WHERE o.state='deleting' OR (o.state<>'deleted' AND NOT EXISTS(SELECT 1 FROM storage_read_leases l WHERE l.object_id=o.id AND l.expires_at>$1) AND ((o.expires_at IS NOT NULL AND o.expires_at<=$1) OR (o.created_at<=$2 AND NOT EXISTS(SELECT 1 FROM storage_uploads u WHERE u.object_id=o.id AND u.state IN ('created','writing','uploaded') AND u.lease_until>$1) AND NOT EXISTS(SELECT 1 FROM storage_pins p WHERE p.object_id=o.id AND (p.state='unresolved' OR p.state='pending' OR (p.state='active' AND p.expires_at>$1))) AND NOT EXISTS(SELECT 1 FROM storage_snapshot_refs r JOIN storage_objects sn ON sn.id=r.snapshot_id WHERE r.resource_id=o.id AND sn.state<>'deleted') AND NOT EXISTS(SELECT 1 FROM storage_artifacts a JOIN storage_objects ar ON ar.id=a.id WHERE a.snapshot_id=o.id AND ar.state='ready' AND ar.expires_at>$1)))) ORDER BY o.created_at LIMIT 100`, now, now.Add(-s.Config.OrphanGrace))
+		rows, e := t.Query(ctx, `SELECT o.id FROM storage_objects o WHERE o.state='deleting' OR (o.state<>'deleted' AND NOT EXISTS(SELECT 1 FROM storage_read_leases l WHERE l.object_id=o.id AND l.expires_at>$1) AND ((o.expires_at IS NOT NULL AND o.expires_at<=$1) OR (o.created_at<=$2 AND NOT EXISTS(SELECT 1 FROM storage_uploads u WHERE u.object_id=o.id AND u.state IN ('created','writing','uploaded') AND u.lease_until>$1) AND NOT EXISTS(SELECT 1 FROM storage_pins p WHERE p.object_id=o.id AND (p.state='unresolved' OR p.state='pending' OR (p.state='active' AND p.expires_at>$1))) AND NOT EXISTS(SELECT 1 FROM storage_snapshot_refs r JOIN storage_objects sn ON sn.id=r.snapshot_id WHERE r.resource_id=o.id AND sn.state<>'deleted') AND NOT EXISTS(SELECT 1 FROM storage_artifacts a JOIN storage_objects ar ON ar.id=a.id WHERE a.snapshot_id=o.id AND ar.state='ready' AND ar.expires_at>$1)))) ORDER BY o.gc_attempted_at NULLS FIRST,o.created_at,o.id LIMIT 100`, now, now.Add(-s.Config.OrphanGrace))
 		if e != nil {
 			return e
 		}
@@ -69,7 +69,7 @@ func (s *Service) GC(ctx context.Context) error {
 			if e != nil {
 				return e
 			}
-			if _, e = t.Exec(ctx, "UPDATE storage_objects SET state='deleting' WHERE id=$1", oid); e != nil {
+			if _, e = t.Exec(ctx, "UPDATE storage_objects SET state='deleting',gc_attempted_at=$2 WHERE id=$1", oid, now); e != nil {
 				return e
 			}
 			if _, e = t.Exec(ctx, "UPDATE storage_uploads SET state='deleted' WHERE object_id=$1 AND state<>'committed'", oid); e != nil {
@@ -88,7 +88,9 @@ func (s *Service) GC(ctx context.Context) error {
 			if o.Version == "" {
 				physical, exists, lookupErr := s.Blob.Find(ctx, o.Key)
 				if lookupErr != nil {
-					return lookupErr
+					gcErrors.Add(1)
+					slog.Error("storage deletion lookup retry", "objectId", o.ID, "error", lookupErr)
+					continue
 				}
 				if exists {
 					o.Version = physical.Version
@@ -135,7 +137,7 @@ func (s *Service) GC(ctx context.Context) error {
 			if _, e := t.Exec(ctx, "UPDATE storage_objects SET state='deleted' WHERE id=$1 AND state='deleting'", o.ID); e != nil {
 				return e
 			}
-			if _, e := t.Exec(ctx, "UPDATE storage_physical_versions SET state='deleted' WHERE physical_key=$1 AND version=$2", o.Key, o.Version); e != nil {
+			if _, e := t.Exec(ctx, "UPDATE storage_physical_versions SET state='deleted',inventory_retry_at=NULL,inventory_last_attempt_at=NULL WHERE physical_key=$1 AND version=$2", o.Key, o.Version); e != nil {
 				return e
 			}
 			_, e := t.Exec(ctx, "INSERT INTO storage_deletion_history VALUES($1,$2,$3,$4) ON CONFLICT DO NOTHING", o.ID, now, o.Class, o.Size)
@@ -222,9 +224,109 @@ func (s *Service) reconcilePins(ctx context.Context) error {
 	gcUnresolved.Store(unresolved)
 	return nil
 }
+
+type physicalVersionID struct{ key, version string }
+
+func (s *Service) claimInventoryRetries(ctx context.Context) ([]Physical, error) {
+	items := []Physical{}
+	e := s.DB.tx(ctx, func(t pgx.Tx, now time.Time) error {
+		rows, e := t.Query(ctx, `SELECT physical_key,version FROM storage_physical_versions WHERE state='ready' AND inventory_retry_at<=$1 ORDER BY inventory_last_attempt_at NULLS FIRST,inventory_retry_at,physical_key,version LIMIT 100 FOR UPDATE SKIP LOCKED`, now)
+		if e != nil {
+			return e
+		}
+		for rows.Next() {
+			var item Physical
+			if e = rows.Scan(&item.Key, &item.Version); e != nil {
+				rows.Close()
+				return e
+			}
+			items = append(items, item)
+		}
+		e = rows.Err()
+		rows.Close()
+		if e != nil {
+			return e
+		}
+		for _, item := range items {
+			if _, e = t.Exec(ctx, `UPDATE storage_physical_versions SET inventory_last_attempt_at=$3 WHERE physical_key=$1 AND version=$2 AND state='ready' AND inventory_retry_at<=$3`, item.Key, item.Version, now); e != nil {
+				return e
+			}
+		}
+		return nil
+	})
+	return items, e
+}
+
+// tryDeleteInventoryVersion rechecks exact-version ownership and active writers
+// immediately before each external delete. Failed or not-yet-safe versions keep
+// a durable retry marker so the inventory cursor can progress independently.
+func (s *Service) tryDeleteInventoryVersion(ctx context.Context, item Physical) error {
+	eligible := false
+	e := s.DB.tx(ctx, func(t pgx.Tx, now time.Time) error {
+		_, e := t.Exec(ctx, "INSERT INTO storage_physical_versions(physical_key,version,created_at) VALUES($1,$2,$3) ON CONFLICT DO NOTHING", item.Key, item.Version, now)
+		if e != nil {
+			return e
+		}
+		var first time.Time
+		var state string
+		if e = t.QueryRow(ctx, "SELECT created_at,state FROM storage_physical_versions WHERE physical_key=$1 AND version=$2", item.Key, item.Version).Scan(&first, &state); e != nil {
+			return e
+		}
+		if state != "ready" {
+			return nil
+		}
+		var canonical, liveWriter bool
+		if e = t.QueryRow(ctx, `SELECT EXISTS(SELECT 1 FROM storage_objects o WHERE o.physical_key=$1 AND o.version=$2 AND o.state='ready')`, item.Key, item.Version).Scan(&canonical); e != nil {
+			return e
+		}
+		if canonical {
+			_, e = t.Exec(ctx, "UPDATE storage_physical_versions SET inventory_retry_at=NULL,inventory_last_attempt_at=NULL WHERE physical_key=$1 AND version=$2 AND state='ready'", item.Key, item.Version)
+			return e
+		}
+		if e = t.QueryRow(ctx, `SELECT EXISTS(SELECT 1 FROM storage_objects o JOIN storage_uploads u ON u.object_id=o.id WHERE o.physical_key=$1 AND u.lease_until>$2 AND u.state IN ('created','writing','uploaded'))`, item.Key, now).Scan(&liveWriter); e != nil {
+			return e
+		}
+		if liveWriter || now.Before(first.Add(s.Config.OrphanGrace)) {
+			return nil
+		}
+		eligible = true
+		_, e = t.Exec(ctx, `UPDATE storage_physical_versions SET inventory_retry_at=COALESCE(inventory_retry_at,$3),inventory_last_attempt_at=$3 WHERE physical_key=$1 AND version=$2 AND state='ready'`, item.Key, item.Version, now)
+		return e
+	})
+	if e != nil || !eligible {
+		return e
+	}
+	if !item.exact() {
+		gcErrors.Add(1)
+		slog.Error("storage inventory version is not exact; retaining for retry", "key", item.Key)
+		return nil
+	}
+	if e = s.Blob.Delete(ctx, item); e != nil {
+		gcErrors.Add(1)
+		slog.Error("storage inventory deletion retry", "key", item.Key, "version", item.Version, "error", e)
+		return nil
+	}
+	gcOrphans.Add(1)
+	return s.DB.tx(ctx, func(t pgx.Tx, _ time.Time) error {
+		_, e := t.Exec(ctx, "UPDATE storage_physical_versions SET state='deleted',inventory_retry_at=NULL,inventory_last_attempt_at=NULL WHERE physical_key=$1 AND version=$2 AND state='ready'", item.Key, item.Version)
+		return e
+	})
+}
+
 func (s *Service) inventory(ctx context.Context) error {
+	retries, e := s.claimInventoryRetries(ctx)
+	if e != nil {
+		return e
+	}
+	attempted := make(map[physicalVersionID]bool, len(retries))
+	for _, item := range retries {
+		attempted[physicalVersionID{item.Key, item.Version}] = true
+		if e = s.tryDeleteInventoryVersion(ctx, item); e != nil {
+			return e
+		}
+	}
 	var cursorKey, cursorVersion string
-	if e := s.DB.Pool.QueryRow(ctx, "SELECT physical_key,version FROM storage_gc_cursor WHERE id=1").Scan(&cursorKey, &cursorVersion); e != nil {
+	if e = s.DB.Pool.QueryRow(ctx, "SELECT physical_key,version FROM storage_gc_cursor WHERE id=1").Scan(&cursorKey, &cursorVersion); e != nil {
 		return e
 	}
 	items, nextKey, nextVersion, e := s.Blob.Inventory(ctx, cursorKey, cursorVersion)
@@ -250,41 +352,15 @@ func (s *Service) inventory(ctx context.Context) error {
 		return e
 	}
 	for _, item := range items {
+		versionID := physicalVersionID{item.Key, item.Version}
+		if attempted[versionID] {
+			continue
+		}
+		attempted[versionID] = true
 		if live[item.Key] {
 			continue
 		}
-		eligible := false
-		e = s.DB.tx(ctx, func(t pgx.Tx, now time.Time) error {
-			_, e := t.Exec(ctx, "INSERT INTO storage_physical_versions(physical_key,version,created_at) VALUES($1,$2,$3) ON CONFLICT DO NOTHING", item.Key, item.Version, now)
-			if e != nil {
-				return e
-			}
-			var first time.Time
-			var state string
-			e = t.QueryRow(ctx, "SELECT created_at,state FROM storage_physical_versions WHERE physical_key=$1 AND version=$2", item.Key, item.Version).Scan(&first, &state)
-			if e != nil {
-				return e
-			}
-			var protected bool
-			e = t.QueryRow(ctx, `SELECT EXISTS(SELECT 1 FROM storage_objects o WHERE physical_key=$1 AND ((state='ready' AND version=$2) OR EXISTS(SELECT 1 FROM storage_uploads u WHERE u.object_id=o.id AND u.lease_until>$3 AND u.state IN ('created','writing','uploaded'))))`, item.Key, item.Version, now).Scan(&protected)
-			if e != nil {
-				return e
-			}
-			eligible = !protected && state != "deleted" && !now.Before(first.Add(s.Config.OrphanGrace))
-			return nil
-		})
-		if e != nil {
-			return e
-		}
-		if !eligible {
-			continue
-		}
-		if e = s.Blob.Delete(ctx, item); e != nil {
-			return e
-		}
-		gcOrphans.Add(1)
-		_, e = s.DB.Pool.Exec(ctx, "UPDATE storage_physical_versions SET state='deleted' WHERE physical_key=$1 AND version=$2", item.Key, item.Version)
-		if e != nil {
+		if e = s.tryDeleteInventoryVersion(ctx, item); e != nil {
 			return e
 		}
 	}

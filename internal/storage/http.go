@@ -101,7 +101,8 @@ func (s *Service) Handler() http.Handler {
 	})
 	register("PUT /internal/v1/uploads/{id}/content", func(w http.ResponseWriter, r *http.Request, p v.Principal) {
 		r.Body = http.MaxBytesReader(w, r.Body, s.Config.MaxUpload+1)
-		x, e := s.Put(r.Context(), p, r.PathValue("id"), r.Header.Get("X-Writer-Token"), r.Body)
+		controller := http.NewResponseController(w)
+		x, e := s.put(r.Context(), p, r.PathValue("id"), r.Header.Get("X-Writer-Token"), r.Body, controller.SetReadDeadline)
 		respond(w, x, e)
 	})
 	register("POST /internal/v1/uploads/{id}/renew", func(w http.ResponseWriter, r *http.Request, p v.Principal) {

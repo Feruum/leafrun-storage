@@ -23,6 +23,13 @@ type lostBlob struct {
 	lose bool
 }
 
+type unreadBody struct{ reads int }
+
+func (r *unreadBody) Read([]byte) (int, error) {
+	r.reads++
+	return 0, errors.New("completed upload replay consumed request body")
+}
+
 func (b *lostBlob) Put(ctx context.Context, key string, f *os.File, h string, n int64) (Physical, error) {
 	p, e := b.Blob.Put(ctx, key, f, h, n)
 	if e == nil && b.lose {
@@ -53,6 +60,14 @@ func TestIntegrationLostS3AckDoesNotCreateSecondVersion(t *testing.T) {
 	versions, e := physical.Client.ListObjectVersions(context.Background(), &s3.ListObjectVersionsInput{Bucket: &physical.Bucket, Prefix: aws.String("storage/resource/uploads/" + u.UploadID)})
 	if e != nil || len(versions.Versions) != 1 {
 		t.Fatal("ambiguous PUT created versions", e, len(versions.Versions))
+	}
+	if _, e = s.DB.Pool.Exec(context.Background(), "UPDATE storage_uploads SET lease_until=clock_timestamp()-interval '1 second' WHERE id=$1", u.UploadID); e != nil {
+		t.Fatal(e)
+	}
+	replayBody := &unreadBody{}
+	replay, e := s.Put(context.Background(), p, u.UploadID, u.WriterToken, replayBody)
+	if e != nil || replay.State != "uploaded" || replayBody.reads != 0 {
+		t.Fatal("expired completed upload did not reconcile without admitting bytes", replay.State, replayBody.reads, e)
 	}
 }
 func TestIntegrationCatalogRefAndPinGCRaces(t *testing.T) {

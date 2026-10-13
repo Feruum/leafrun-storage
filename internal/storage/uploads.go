@@ -138,6 +138,17 @@ func (s *Service) Renew(ctx context.Context, p v.Principal, uid, token string) (
 	return out, e
 }
 func (s *Service) Put(ctx context.Context, p v.Principal, uid, token string, body io.Reader) (v.Upload, error) {
+	return s.put(ctx, p, uid, token, body, nil)
+}
+
+func uploadDeadlineError(ctx context.Context, deadline time.Time) error {
+	if !time.Now().Before(deadline) {
+		return fail(409, "writer_expired")
+	}
+	return ctx.Err()
+}
+
+func (s *Service) put(ctx context.Context, p v.Principal, uid, token string, body io.Reader, setReadDeadline func(time.Time) error) (v.Upload, error) {
 	u, e := s.GetUpload(ctx, p, uid)
 	if e != nil {
 		return u, e
@@ -145,29 +156,73 @@ func (s *Service) Put(ctx context.Context, p v.Principal, uid, token string, bod
 	if token == "" || u.WriterToken != token {
 		return u, fail(403, "invalid_writer")
 	}
+	leaseStart := time.Now()
+	var dbNow time.Time
+	already := false
+	e = s.DB.tx(ctx, func(t pgx.Tx, now time.Time) error {
+		current, err := upload(ctx, t, uid)
+		if err != nil {
+			return err
+		}
+		if current.State == "uploaded" || current.State == "committed" {
+			if current.WriterToken != token {
+				return fail(403, "invalid_writer")
+			}
+			u, already = current, true
+			return nil
+		}
+		if err := writer(current, token, now); err != nil {
+			return err
+		}
+		u, dbNow = current, now
+		return nil
+	})
+	if e != nil {
+		return u, e
+	}
+	if already {
+		return u, nil
+	}
+	deadline := leaseStart.Add(u.LeaseUntil.Sub(dbNow))
+	if !time.Now().Before(deadline) {
+		return u, fail(409, "writer_expired")
+	}
+	workCtx, cancel := context.WithDeadline(ctx, deadline)
+	defer cancel()
+	if setReadDeadline != nil {
+		if e = setReadDeadline(deadline); e != nil {
+			return u, fail(503, "upload_deadline_unavailable")
+		}
+	}
 	f, e := os.CreateTemp(s.Config.Scratch, "leafrun-storage-upload-*")
 	if e != nil {
 		return u, e
 	}
 	name := f.Name()
-	_, e = s.DB.Pool.Exec(ctx, "INSERT INTO storage_scratch(path,upload_id,state,created_at) VALUES($1,$2,'writing',clock_timestamp())", name, uid)
+	defer s.stopScratch(f, uid)
+	_, e = s.DB.Pool.Exec(workCtx, "INSERT INTO storage_scratch(path,upload_id,state,created_at) VALUES($1,$2,'writing',clock_timestamp())", name, uid)
 	if e != nil {
 		f.Close()
 		os.Remove(name)
 		return u, e
 	}
-	defer s.stopScratch(f, uid)
 	h := sha256.New()
 	n, e := io.Copy(io.MultiWriter(f, h), io.LimitReader(body, u.SizeBytes+1))
 	if e != nil {
+		if !time.Now().Before(deadline) {
+			return u, fail(409, "writer_expired")
+		}
 		return u, e
+	}
+	if e = workCtx.Err(); e != nil {
+		return u, uploadDeadlineError(workCtx, deadline)
 	}
 	if n != u.SizeBytes || hex.EncodeToString(h.Sum(nil)) != u.SHA256 {
 		return u, fail(422, "content_mismatch")
 	}
-	already, canWrite := false, false
-	e = s.DB.tx(ctx, func(t pgx.Tx, now time.Time) error {
-		current, e := upload(ctx, t, uid)
+	canWrite := false
+	e = s.DB.tx(workCtx, func(t pgx.Tx, now time.Time) error {
+		current, e := upload(workCtx, t, uid)
 		if e != nil {
 			return e
 		}
@@ -186,14 +241,17 @@ func (s *Service) Put(ctx context.Context, p v.Principal, uid, token string, bod
 			return nil // A lost response can be recovered by HEAD, never by another PUT.
 		}
 		canWrite = true
-		_, e = t.Exec(ctx, "UPDATE storage_uploads SET state='writing' WHERE id=$1", uid)
+		_, e = t.Exec(workCtx, "UPDATE storage_uploads SET state='writing' WHERE id=$1", uid)
 		return e
 	})
 	if e != nil || already {
 		return u, e
 	}
 	key := "storage/" + string(u.Class) + "/uploads/" + uid
-	physical, exists, e := s.Blob.Find(ctx, key)
+	if !time.Now().Before(deadline) {
+		return u, fail(409, "writer_expired")
+	}
+	physical, exists, e := s.Blob.Find(workCtx, key)
 	if e == nil && exists && (physical.Hash != u.SHA256 || physical.Size != u.SizeBytes) {
 		e = fail(409, "physical_conflict")
 	}
@@ -201,17 +259,28 @@ func (s *Service) Put(ctx context.Context, p v.Principal, uid, token string, bod
 		if !canWrite {
 			return u, fail(409, "write_in_progress")
 		}
-		physical, e = s.Blob.Put(ctx, key, f, u.SHA256, u.SizeBytes)
+		if workCtx.Err() != nil {
+			return u, uploadDeadlineError(workCtx, deadline)
+		}
+		physical, e = s.Blob.Put(workCtx, key, f, u.SHA256, u.SizeBytes)
 	}
 	if e != nil {
+		if !time.Now().Before(deadline) {
+			return u, fail(409, "writer_expired")
+		}
 		return u, e
 	}
-	e = s.DB.tx(context.WithoutCancel(ctx), func(t pgx.Tx, now time.Time) error {
-		_, err := t.Exec(context.WithoutCancel(ctx), "INSERT INTO storage_physical_versions(physical_key,version,object_id,created_at) VALUES($1,$2,$3,$4) ON CONFLICT DO NOTHING", physical.Key, physical.Version, uid, now)
+	if !time.Now().Before(deadline) {
+		return u, fail(409, "writer_expired")
+	}
+	commitCtx, cancelCommit := context.WithDeadline(context.WithoutCancel(ctx), deadline)
+	defer cancelCommit()
+	e = s.DB.tx(commitCtx, func(t pgx.Tx, now time.Time) error {
+		_, err := t.Exec(commitCtx, "INSERT INTO storage_physical_versions(physical_key,version,object_id,created_at) VALUES($1,$2,$3,$4) ON CONFLICT DO NOTHING", physical.Key, physical.Version, uid, now)
 		if err != nil {
 			return err
 		}
-		current, err := upload(context.WithoutCancel(ctx), t, uid)
+		current, err := upload(commitCtx, t, uid)
 		if err != nil {
 			return err
 		}
@@ -222,19 +291,19 @@ func (s *Service) Put(ctx context.Context, p v.Principal, uid, token string, bod
 		if err = writer(current, token, now); err != nil {
 			return err
 		}
-		o, err := getObject(context.WithoutCancel(ctx), t, uid)
+		o, err := getObject(commitCtx, t, uid)
 		if err != nil {
 			return err
 		}
 		if o.State != "staging" {
 			return fail(409, "writer_fenced")
 		}
-		_, err = t.Exec(context.WithoutCancel(ctx), "UPDATE storage_objects SET version=$2 WHERE id=$1", uid, physical.Version)
+		_, err = t.Exec(commitCtx, "UPDATE storage_objects SET version=$2 WHERE id=$1", uid, physical.Version)
 		if err != nil {
 			return err
 		}
-		_, err = t.Exec(context.WithoutCancel(ctx), "UPDATE storage_uploads SET state='uploaded' WHERE id=$1", uid)
-		u, err = upload(context.WithoutCancel(ctx), t, uid)
+		_, err = t.Exec(commitCtx, "UPDATE storage_uploads SET state='uploaded' WHERE id=$1", uid)
+		u, err = upload(commitCtx, t, uid)
 		return err
 	})
 	return u, e
