@@ -145,6 +145,10 @@ func (s *Service) Handler() http.Handler {
 		x, e := s.GetSnapshot(r.Context(), p, r.PathValue("id"))
 		respond(w, x, e)
 	})
+	register("GET /internal/v1/resources/{id}", func(w http.ResponseWriter, r *http.Request, p v.Principal) {
+		x, e := s.GetResource(r.Context(), p, r.PathValue("id"))
+		respond(w, x, e)
+	})
 	register("GET /v1/artifacts/{id}", func(w http.ResponseWriter, r *http.Request, p v.Principal) {
 		x, e := s.GetArtifact(r.Context(), p, r.PathValue("id"))
 		respond(w, x, e)

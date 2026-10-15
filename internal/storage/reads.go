@@ -9,6 +9,41 @@ import (
 	"time"
 )
 
+// GetResource returns an authorized point-in-time descriptor. Callers that need
+// bytes later must still acquire a pin; metadata alone does not retain them.
+func (s *Service) GetResource(ctx context.Context, p v.Principal, oid string) (v.Resource, error) {
+	var out v.Resource
+	initial, err := getObject(ctx, s.DB.Pool, oid)
+	if err != nil {
+		return out, err
+	}
+	if err = s.authorize(ctx, p, initial.Scope, "resource.read", oid); err != nil {
+		return out, err
+	}
+	err = s.DB.tx(ctx, func(tx pgx.Tx, now time.Time) error {
+		current, err := getObject(ctx, tx, oid)
+		if err != nil {
+			return err
+		}
+		if current.Scope != initial.Scope || current.Class != v.ClassResource && current.Class != v.ClassRecovery {
+			return fail(404, "not_found")
+		}
+		var committed bool
+		if err = tx.QueryRow(ctx, "SELECT EXISTS(SELECT 1 FROM storage_resources WHERE id=$1)", oid).Scan(&committed); err != nil {
+			return err
+		}
+		if !committed {
+			return fail(404, "not_found")
+		}
+		if err = ready(current, now); err != nil {
+			return err
+		}
+		out = resource(current)
+		return nil
+	})
+	return out, err
+}
+
 type leasedReader struct {
 	body    io.ReadCloser
 	cancel  context.CancelFunc
