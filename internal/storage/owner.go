@@ -5,6 +5,7 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	jsonvalue "github.com/leafrun/leafrun-contracts/jsonvalue/v1"
 	v "github.com/leafrun/leafrun-contracts/storage/v1"
 	"io"
 	"net/http"
@@ -44,7 +45,11 @@ func (o *HTTPOwner) call(ctx context.Context, path string, input, output any) er
 	if res.StatusCode != 200 {
 		return fail(503, "owner_unavailable")
 	}
-	if e = json.NewDecoder(io.LimitReader(res.Body, 1<<20)).Decode(output); e != nil {
+	data, e := io.ReadAll(io.LimitReader(res.Body, (1<<20)+1))
+	if e != nil || len(data) > 1<<20 {
+		return fail(503, "owner_invalid_response")
+	}
+	if e = jsonvalue.Unmarshal(data, output, 1<<20); e != nil {
 		return fail(503, "owner_invalid_response")
 	}
 	return nil
