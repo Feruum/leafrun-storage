@@ -219,6 +219,15 @@ func (s *Service) Handler() http.Handler {
 		x, e := s.GetPin(r.Context(), p, r.PathValue("id"))
 		respond(w, x, e)
 	})
+	register("POST /internal/v1/pins/{id}/release", func(w http.ResponseWriter, r *http.Request, p v.Principal) {
+		var in v.PinReleaseRequest
+		if e := decode(r, &in); e != nil {
+			writeError(w, e)
+			return
+		}
+		x, e := s.ReleasePinBound(r.Context(), p, r.PathValue("id"), in)
+		respond(w, x, e)
+	})
 	register("POST /internal/v1/pins/{id}/activate", func(w http.ResponseWriter, r *http.Request, p v.Principal) {
 		x, e := s.ActivatePin(r.Context(), p, r.PathValue("id"))
 		respond(w, x, e)

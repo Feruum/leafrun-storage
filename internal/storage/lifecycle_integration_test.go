@@ -13,17 +13,24 @@ func TestIntegrationReadDeadlineAndCancellation(t *testing.T) {
 	s, p := integration(t)
 	scope := v.Scope{WorkspaceID: id(), ProjectID: id()}
 	r := committed(t, s, p, scope, "bounded read")
-	s.Config.ReadLease = 25 * time.Millisecond
+	// Leave enough time for real S3/DB admission under a busy integration stand;
+	// assert the admitted lease's deadline rather than transport latency.
+	s.Config.ReadLease = time.Second
 	body, _, _, e := s.OpenRead(context.Background(), p, r.ResourceID, false)
 	if e != nil {
 		t.Fatal(e)
 	}
-	time.Sleep(40 * time.Millisecond)
+	deadline, ok := body.(*leasedReader).Deadline()
+	if !ok {
+		t.Fatal("read lease has no deadline")
+	}
+	time.Sleep(max(0, time.Until(deadline)) + 20*time.Millisecond)
 	_, e = io.ReadAll(body)
 	if e == nil {
 		t.Fatal("read continued after lease deadline")
 	}
 	ctx, cancel := context.WithCancel(context.Background())
+	s.Config.ReadLease = time.Minute
 	body, _, _, e = s.OpenRead(ctx, p, r.ResourceID, false)
 	if e != nil {
 		t.Fatal(e)

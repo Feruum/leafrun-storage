@@ -2,8 +2,10 @@ package storage
 
 import (
 	"context"
+	"errors"
 	"github.com/jackc/pgx/v5"
 	v "github.com/leafrun/leafrun-contracts/storage/v1"
+	"strings"
 	"time"
 )
 
@@ -201,4 +203,47 @@ func (s *Service) ReleasePin(ctx context.Context, p v.Principal, pid string) err
 		_, e = t.Exec(ctx, "UPDATE storage_pins SET state='released' WHERE id=$1", pid)
 		return e
 	})
+}
+
+// ReleasePinBound confirms the desired state of one caller-owned binding.
+// Authenticate and authorize the declared scope before looking up the pin so
+// a missing reference and a foreign reference have the same safe result.
+func (s *Service) ReleasePinBound(ctx context.Context, p v.Principal, pid string, in v.PinReleaseRequest) (v.PinReleaseReceipt, error) {
+	var out v.PinReleaseReceipt
+	if !validScope(in.Scope) || !pinReleaseIdentifier(pid) || !pinReleaseIdentifier(in.ObjectID) || (in.RetentionPolicy != "ordinary" && in.RetentionPolicy != "release" && in.RetentionPolicy != "recovery") {
+		return out, fail(400, "invalid_pin_binding")
+	}
+	if in.HolderID != p.Subject || in.HolderDomain != p.Domain {
+		return out, fail(403, "holder_mismatch")
+	}
+	if err := s.authorize(ctx, p, in.Scope, "pin.release", pid); err != nil {
+		return out, err
+	}
+	out = v.PinReleaseReceipt{PinID: pid, Binding: in, State: v.PinReleaseAbsent}
+	err := s.DB.tx(ctx, func(tx pgx.Tx, _ time.Time) error {
+		current, err := pin(ctx, tx, pid)
+		if err != nil {
+			var missing *fault
+			if errors.As(err, &missing) && missing.Status == 404 && missing.Code == "not_found" {
+				return nil
+			}
+			return err
+		}
+		if current.Scope != in.Scope || current.ObjectID != in.ObjectID || current.HolderID != in.HolderID || current.HolderDomain != in.HolderDomain || current.RetentionPolicy != in.RetentionPolicy {
+			return nil
+		}
+		if _, err = tx.Exec(ctx, "UPDATE storage_pins SET state='released' WHERE id=$1", pid); err != nil {
+			return err
+		}
+		out.State = v.PinReleaseReleased
+		return nil
+	})
+	if err != nil {
+		return v.PinReleaseReceipt{}, err
+	}
+	return out, nil
+}
+
+func pinReleaseIdentifier(value string) bool {
+	return len(value) > 0 && len(value) <= 256 && strings.TrimSpace(value) == value && !strings.ContainsAny(value, "\x00\r\n")
 }
