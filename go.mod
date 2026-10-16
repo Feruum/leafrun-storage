@@ -3,6 +3,8 @@ module github.com/leafrun/leafrun-storage
 go 1.27.0
 
 require (
+	github.com/leafrun/leafrun-platform v0.1.0
+	github.com/nats-io/nats.go v1.54.0
 	github.com/aws/aws-sdk-go-v2 v1.47.3
 	github.com/aws/aws-sdk-go-v2/config v1.33.9
 	github.com/aws/aws-sdk-go-v2/service/s3 v1.114.3

@@ -27,24 +27,6 @@ func OpenDB(ctx context.Context, url string) (*DB, error) {
 	}
 	return &DB{p}, nil
 }
-func (d *DB) Migrate(ctx context.Context) error {
-	entries, e := migrations.ReadDir("migrations")
-	if e != nil {
-		return e
-	}
-	return d.tx(ctx, func(t pgx.Tx, _ time.Time) error {
-		for _, entry := range entries {
-			sql, e := migrations.ReadFile("migrations/" + entry.Name())
-			if e != nil {
-				return e
-			}
-			if _, e = t.Exec(ctx, string(sql)); e != nil {
-				return e
-			}
-		}
-		return nil
-	})
-}
 func (d *DB) tx(ctx context.Context, fn func(pgx.Tx, time.Time) error) error {
 	tx, e := d.Pool.Begin(ctx)
 	if e != nil {

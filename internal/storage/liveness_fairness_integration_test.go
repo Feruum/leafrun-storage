@@ -173,7 +173,7 @@ func TestIntegrationHTTPUploadBodyBoundedByWriterLease(t *testing.T) {
 	}
 	defer conn.Close()
 	_ = conn.SetReadDeadline(time.Now().Add(3 * time.Second))
-	_, e = fmt.Fprintf(conn, "PUT /internal/v1/uploads/%s/content HTTP/1.1\r\nHost: %s\r\nAuthorization: Bearer %s\r\nX-Writer-Token: %s\r\nContent-Length: %d\r\nConnection: close\r\n\r\n",
+	_, e = fmt.Fprintf(conn, "PUT /internal/v1/uploads/%s/content HTTP/1.1\r\nHost: %s\r\nAuthorization: Bearer %s\r\nX-Writer-Token: %s\r\nContent-Type: application/octet-stream\r\nContent-Length: %d\r\nConnection: close\r\n\r\n",
 		u.UploadID, addr, s.Config.Credentials[0].Token, u.WriterToken, len(body))
 	if e != nil {
 		t.Fatal(e)
@@ -225,6 +225,7 @@ func TestIntegrationHTTPUploadFailsClosedWithoutReadDeadline(t *testing.T) {
 	request := httptest.NewRequest("PUT", "/internal/v1/uploads/"+u.UploadID+"/content", strings.NewReader(body))
 	request.Header.Set("Authorization", "Bearer "+s.Config.Credentials[0].Token)
 	request.Header.Set("X-Writer-Token", u.WriterToken)
+	request.Header.Set("Content-Type", "application/octet-stream")
 	response := httptest.NewRecorder()
 	s.Handler().ServeHTTP(response, request)
 	if response.Code != http.StatusServiceUnavailable {

@@ -200,11 +200,14 @@ func (s *Service) Finalize(ctx context.Context, p v.Principal, uid string, in v.
 	return out, e
 }
 func (s *Service) publication(ctx context.Context, p v.Principal, a v.Artifact) error {
-	if e := s.authorize(ctx, p, a.Scope, "artifact.read", a.ArtifactID); e != nil {
-		return e
+	if s.Owner == nil {
+		return fail(503, "owner_unavailable")
 	}
 	ok, e := s.Owner.Publishable(ctx, v.PublishabilityCheck{Scope: a.Scope, OriginJobID: a.OriginJobID, ArtifactID: a.ArtifactID})
 	if e != nil {
+		return e
+	}
+	if e = s.authorize(ctx, p, a.Scope, "artifact.read", a.ArtifactID); e != nil {
 		return e
 	}
 	if !ok {
@@ -221,8 +224,21 @@ func (s *Service) GetArtifact(ctx context.Context, p v.Principal, oid string) (v
 		return v.Artifact{}, e
 	}
 	e = s.DB.tx(ctx, func(t pgx.Tx, now time.Time) error {
+		current, e := artifact(ctx, t, oid)
+		if e != nil {
+			return e
+		}
+		if current.Scope != a.Scope || current.OriginJobID != a.OriginJobID || current.SnapshotID != a.SnapshotID {
+			return fail(404, "not_found")
+		}
 		o, e := getObject(ctx, t, oid)
 		if e != nil {
+			return e
+		}
+		if e = s.publication(ctx, p, current); e != nil {
+			return e
+		}
+		if e = t.QueryRow(ctx, "SELECT clock_timestamp()").Scan(&now); e != nil {
 			return e
 		}
 		return ready(o, now)

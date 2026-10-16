@@ -75,6 +75,7 @@ func (s *Service) OpenRead(ctx context.Context, p v.Principal, oid string, resul
 	if e != nil {
 		return nil, o, 0, e
 	}
+	initial := o
 	if result {
 		a, e := artifact(ctx, s.DB.Pool, oid)
 		if e != nil {
@@ -99,6 +100,38 @@ func (s *Service) OpenRead(ctx context.Context, p v.Principal, oid string, resul
 		if e != nil {
 			return e
 		}
+		if o.Scope != initial.Scope || o.Class != initial.Class || o.Key != initial.Key || o.Version != initial.Version || o.Hash != initial.Hash || o.Size != initial.Size {
+			return fail(404, "not_found")
+		}
+		// All catalog lock waits precede the final live authority check. The
+		// final database clock also accounts for time spent in owner services.
+		// Acquire the INSERT table locks now too: a blocked audit migration or
+		// outbox maintenance cannot create a new authorization window afterward.
+		if s.Config.AuthMode == "access" && p.Domain != "service" {
+			if _, err := t.Exec(ctx, `LOCK TABLE storage_read_leases,storage_download_authorizations,platform_event_outbox IN ROW EXCLUSIVE MODE`); err != nil {
+				return err
+			}
+		}
+		finalCtx, auditScope, auditErr := s.readAuditScope(ctx, p, o, result)
+		if auditErr != nil {
+			return auditErr
+		}
+		if result {
+			a, err := artifact(ctx, t, oid)
+			if err != nil {
+				return err
+			}
+			if err = s.publication(finalCtx, p, a); err != nil {
+				return err
+			}
+		} else {
+			if err := s.authorize(finalCtx, p, o.Scope, "resource.read", oid); err != nil {
+				return err
+			}
+		}
+		if e = t.QueryRow(ctx, "SELECT clock_timestamp()").Scan(&now); e != nil {
+			return e
+		}
 		if e = ready(o, now); e != nil {
 			return e
 		}
@@ -108,7 +141,10 @@ func (s *Service) OpenRead(ctx context.Context, p v.Principal, oid string, resul
 		}
 		duration = deadline.Sub(now)
 		_, e = t.Exec(ctx, "INSERT INTO storage_read_leases VALUES($1,$2,$3)", lid, oid, deadline)
-		return e
+		if e != nil {
+			return e
+		}
+		return enqueueReadAudit(finalCtx, t, o, auditScope, now)
 	})
 	if e != nil {
 		return nil, o, 0, e

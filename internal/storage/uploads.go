@@ -19,6 +19,12 @@ type Service struct {
 }
 
 func (s *Service) authorize(ctx context.Context, p v.Principal, scope v.Scope, op, oid string) error {
+	if s.Config.AuthMode == "access" {
+		if p.Domain == "service" {
+			return s.localServiceAction(p, op)
+		}
+		return s.currentPublicAccess(ctx, p, scope, op, oid)
+	}
 	if s.Owner == nil {
 		return fail(503, "owner_unavailable")
 	}

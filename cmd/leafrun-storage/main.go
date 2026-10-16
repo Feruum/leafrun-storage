@@ -20,7 +20,12 @@ func main() {
 }
 func run() error {
 	if len(os.Args) != 2 {
-		return fmt.Errorf("usage: leafrun-storage api|worker|migrate|probe-s3")
+		return fmt.Errorf("usage: leafrun-storage api|worker|migrate|probe-s3|event-relay")
+	}
+	if os.Args[1] == "event-relay" {
+		ctx, cancel := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
+		defer cancel()
+		return storage.RunAuditRelay(ctx, os.Getenv)
 	}
 	cfg, e := storage.LoadConfig()
 	if e != nil {

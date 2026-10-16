@@ -7,6 +7,8 @@ import (
 
 func configFixture(t *testing.T) {
 	t.Helper()
+	t.Setenv("LEAFRUN_STORAGE_AUTH_MODE", "dev")
+	t.Setenv("LEAFRUN_STORAGE_DEV_FIXTURES", "true")
 	t.Setenv("LEAFRUN_STORAGE_DATABASE_URL", "postgres://local/storage")
 	t.Setenv("LEAFRUN_STORAGE_S3_BUCKET", "private")
 	t.Setenv("LEAFRUN_STORAGE_OWNER_URL", "http://owner")

@@ -40,6 +40,9 @@ func (s *Service) GC(ctx context.Context) error {
 	if e = s.reconcilePins(ctx); e != nil {
 		return e
 	}
+	if e = s.pruneReadAudit(ctx); e != nil {
+		return e
+	}
 	var objects []object
 	e = s.DB.tx(ctx, func(t pgx.Tx, now time.Time) error {
 		_, e := t.Exec(ctx, "DELETE FROM storage_read_leases WHERE expires_at<=$1", now)
